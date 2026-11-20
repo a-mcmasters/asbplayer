@@ -93,7 +93,12 @@ import {
 import type { DictionaryProvider } from '@project/common/dictionary-db';
 import DictionaryImport from '@project/common/components/DictionaryImport';
 import type { InternalToken } from '@project/common/annotations';
-import { ASB_TOKEN_HIGHLIGHT_CLASS, computeRichText, getAnnotationsForRender } from '@project/common/annotations';
+import {
+    ASB_TOKEN_HIGHLIGHT_CLASS,
+    bindNativeTokenSelection,
+    computeRichText,
+    getAnnotationsForRender,
+} from '@project/common/annotations';
 import WordBrowserDialog from '@project/common/components/WordBrowserDialog';
 import '@project/common/app/components/subtitles.css';
 import SettingsGroups from '@project/common/components/SettingsGroups';
@@ -534,6 +539,7 @@ const DictionarySettingsTab: React.FC<Props> = ({
     anki,
 }) => {
     const { t } = useTranslation();
+    useEffect(() => bindNativeTokenSelection(document), []);
     const { ankiConnectUrl, ankiConnectApiKey, dictionaryTracks } = settings;
     const initialDictionaryTracksRef = useRef(dictionaryTracks);
     const [tokenAnnotationTarget, setTokenAnnotationTarget] = useState<TokenAnnotationConfigTarget>('video');
