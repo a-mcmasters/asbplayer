@@ -32,7 +32,7 @@ function* textFragments(node: Node, range: Range, skipElement: (node: Element) =
     for (const child of node.childNodes) yield* textFragments(child, range, skipElement);
 }
 
-export const selectedSubtitleText = (document: Document, selection: AbstractRange) => {
+const selectedSubtitleText = (document: Document, selection: AbstractRange) => {
     const view = document.defaultView;
     if (!view) return;
     const { startContainer, startOffset, endContainer, endOffset } = selection;
@@ -87,4 +87,19 @@ export const selectedSubtitleText = (document: Document, selection: AbstractRang
     }
     const text = parts.join('');
     if (!crossesShadowBoundary && text.trim()) return text;
+};
+
+export const createSubtitleCopyHandler = (document: Document, getRange: () => AbstractRange | undefined) => {
+    return (event: ClipboardEvent) => {
+        if (event.defaultPrevented || !event.clipboardData) return;
+        const target = event.composedPath()[0];
+        if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea'))) {
+            return;
+        }
+        const range = getRange();
+        const text = range && selectedSubtitleText(document, range);
+        if (text === undefined) return;
+        event.clipboardData.setData('text/plain', text);
+        event.preventDefault();
+    };
 };
