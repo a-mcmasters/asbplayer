@@ -101,6 +101,9 @@ const fetchDataForLanguageOnDemand = (language: string): Promise<VideoData> => {
 
 const globalStateProvider = new ExtensionGlobalStateProvider();
 
+// Keyed by path: streaming sites put the title id there (e.g. disneyplus.com/play/<id>), and query strings vary.
+const rememberedFileKey = () => `rememberedSubtitleFile:${window.location.host}${window.location.pathname}`;
+
 export default class VideoDataSyncController {
     private readonly _context: Binding;
     private readonly _domain: string;
@@ -167,7 +170,7 @@ export default class VideoDataSyncController {
     }
 
     unbind() {
-        this._transcription.reset();
+        this._transcription.stop();
         this.cancelSubtitleLoad({ clearSubtitles: false });
         if (this._dataReceivedListener) {
             this._dataReceivedEventTarget?.removeEventListener(
@@ -235,8 +238,8 @@ export default class VideoDataSyncController {
             this.cancelSubtitleLoad({ clearSubtitles: false });
         }
         if (request.kind === 'reload') {
-            if (request.videoChanged) this._transcription.reset();
-            else this._transcription.resetIfLocationChanged();
+            if (request.videoChanged) this._transcription.stop();
+            else this._transcription.stopIfLocationChanged();
         }
         if (!this._context.hasPageScript) {
             return;
@@ -431,13 +434,12 @@ export default class VideoDataSyncController {
             completeMatch: false,
         };
 
-        if (this.lastLanguagesSynced.length === 0) {
-            const localTranscript = subtitleTrackChoices.find(isLocalTranscriptTrack);
-            if (localTranscript !== undefined) {
-                tracks.autoSelectedTracks[0] = localTranscript;
-                tracks.completeMatch = true;
-                return tracks;
-            }
+        // A Whisper transcript was made for this video on purpose: load it whatever language was used last.
+        const localTranscript = subtitleTrackChoices.find(isLocalTranscriptTrack);
+        if (localTranscript !== undefined) {
+            tracks.autoSelectedTracks[0] = localTranscript;
+            tracks.completeMatch = true;
+            return tracks;
         }
 
         const emptyChoice = this.lastLanguagesSynced.some((lang) => lang !== '-') === undefined;
@@ -507,11 +509,17 @@ export default class VideoDataSyncController {
         return !isFirefoxBuild && !this._isTutorial && !!this._syncedData?.basename.trim();
     }
 
-    private _startTranscription() {
+    private _continueTranscription(data: VideoData) {
+        // An episode with a Whisper transcript already loaded is done; continuing would overwrite it.
+        if (data.subtitles === undefined || data.subtitles.some(isLocalTranscriptTrack)) return;
+        this._startTranscription(true);
+    }
+
+    private _startTranscription(continuing = false) {
         const key = this._syncedData?.basename;
         if (!this._canTranscribe() || !key) return;
 
-        void this._transcription.start(
+        void this._transcription[continuing ? 'continueOnto' : 'start'](
             key,
             async () => {
                 this._frame.clientIfLoaded?.updateState({ open: false });
@@ -543,13 +551,58 @@ export default class VideoDataSyncController {
     private async _setSyncedData(data: VideoData) {
         const previousData = this._syncedData;
         this._syncedData = data;
+        this._continueTranscription(data);
 
         if (this._updateOpenPickerFromRefresh(previousData, data)) return;
 
         const wasLoading = previousData?.subtitles === undefined;
+        if (await this._loadRememberedFile()) return;
         if (await this._handleAutoSync(wasLoading)) return;
 
         await this._updatePickerAfterDataReceived(wasLoading);
+    }
+
+    /** Reloads the local file last opened for this video, independent of the streaming auto-sync setting. */
+    private async _loadRememberedFile(): Promise<boolean> {
+        if (this._syncedData?.subtitles === undefined || this._autoSyncAttempted || this.pickerVisible) return false;
+        const key = rememberedFileKey();
+        const files = (await browser.storage.local.get(key))[key] as SerializedSubtitleFile[] | undefined;
+        if (!files?.length) return false;
+        this._autoSyncAttempted = true;
+        asbTrace('subtitle/sync', 'Loading remembered local subtitle file', { fileCount: files.length });
+        return this._syncLocalFiles(files, (e) => asbError('subtitle/error', 'Failed to load remembered file', e));
+    }
+
+    // Local files picked in the track dropdown are remembered; a streaming-only choice forgets any remembered file.
+    private async _rememberConfirmedFiles(data: ConfirmedVideoDataSubtitleTrack[]) {
+        const key = rememberedFileKey();
+        try {
+            const files = await Promise.all(
+                data.flatMap(({ file }) =>
+                    file ? [file.arrayBuffer().then((b) => ({ name: file.name, base64: bufferToBase64(b) }))] : []
+                )
+            );
+            await (files.length ? browser.storage.local.set({ [key]: files }) : browser.storage.local.remove(key));
+        } catch (error) {
+            asbError('video/sync', 'Failed to remember subtitle file:', error);
+        }
+    }
+
+    private async _syncLocalFiles(files: SerializedSubtitleFile[], onError: (e: Error) => unknown) {
+        const load = this._beginSubtitleLoad({ clearSubtitles: true });
+        try {
+            await this._syncSubtitles(
+                files.map((file) => ({ fileParts: [file] })),
+                load.controller.signal,
+                undefined
+            );
+            return true;
+        } catch (e) {
+            if (!load.controller.signal.aborted && e instanceof Error) await onError(e);
+            return false;
+        } finally {
+            if (this._subtitleLoad === load) this._subtitleLoad = undefined;
+        }
     }
 
     private _updateOpenPickerFromRefresh(previousData: VideoData | undefined, data: VideoData): boolean {
@@ -724,25 +777,14 @@ export default class VideoDataSyncController {
                             isNewSource: true,
                             syncWithAsbplayerId: confirmMessage.syncWithAsbplayerId,
                         });
+                        if (dataWasSynced) await this._rememberConfirmedFiles(data);
                     } else if ('openFile' === message.command) {
-                        dataWasSynced = false;
-                        const load = this._beginSubtitleLoad({ clearSubtitles: true });
-                        const openFileMessage = message as VideoDataUiBridgeOpenFileMessage;
-                        const subtitleFiles = openFileMessage.subtitles;
-
-                        try {
-                            await this._syncSubtitles(
-                                subtitleFiles.map((subtitleFile) => ({ fileParts: [subtitleFile] })),
-                                load.controller.signal,
-                                undefined
-                            );
-                            dataWasSynced = true;
-                        } catch (e) {
-                            if (!load.controller.signal.aborted && e instanceof Error) {
-                                await this._reportError(e.message);
-                            }
-                        } finally {
-                            if (this._subtitleLoad === load) this._subtitleLoad = undefined;
+                        const subtitleFiles = (message as VideoDataUiBridgeOpenFileMessage).subtitles;
+                        dataWasSynced = await this._syncLocalFiles(subtitleFiles, (e) => this._reportError(e.message));
+                        if (dataWasSynced) {
+                            await browser.storage.local
+                                .set({ [rememberedFileKey()]: subtitleFiles })
+                                .catch((error) => asbError('video/sync', 'Failed to remember subtitle file:', error));
                         }
                     }
 
