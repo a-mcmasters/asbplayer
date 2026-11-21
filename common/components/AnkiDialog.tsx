@@ -55,6 +55,7 @@ import AnkiDialogTutorialBubble from '@project/common/components/AnkiDialogTutor
 import CardSelectView from '@project/common/components/CardSelectView';
 
 const quickSelectShortcut = isMacOs ? '⌘+⇧+Enter' : 'Alt+Shift+Enter';
+const sentenceTranslationField = 'Sentence Translation';
 
 const useStyles = makeStyles<Theme>((theme) => ({
     root: {
@@ -221,6 +222,8 @@ interface AnkiDialogProps {
     showQuickSelectFtue?: boolean;
     onDismissShowQuickSelectFtue?: () => void;
     inTutorial?: boolean;
+    /** Looks up the word's meaning as used in the sentence, to pre-fill the definition field. */
+    onRequestDefinition?: (word: string, sentence: string) => Promise<string | undefined>;
 }
 
 const AnkiDialog = ({
@@ -251,6 +254,7 @@ const AnkiDialog = ({
     showQuickSelectFtue,
     onDismissShowQuickSelectFtue,
     inTutorial,
+    onRequestDefinition,
 }: AnkiDialogProps) => {
     const classes = useStyles();
     const [definition, setDefinition] = useState<string>('');
@@ -366,6 +370,77 @@ const AnkiDialog = ({
         initialWord,
         initialCustomFieldValues,
     ]);
+
+    // Pre-fill the definition with the word's meaning in this sentence, but never overwrite one you typed yourself.
+    const autoDefinitionRef = useRef<{ request: string; definition: string }>(undefined);
+    useEffect(() => {
+        const trimmedWord = word.trim();
+        const request = `${trimmedWord}
+${text}`;
+        const lastAuto = autoDefinitionRef.current;
+
+        if (
+            !open ||
+            !onRequestDefinition ||
+            !trimmedWord ||
+            !text.trim() ||
+            (lastAuto?.request === request && definition === lastAuto.definition) ||
+            (definition !== '' && definition !== lastAuto?.definition)
+        ) {
+            return;
+        }
+
+        let cancelled = false;
+        // Wait until you stop typing the word.
+        const timeout = setTimeout(() => {
+            onRequestDefinition(trimmedWord, text)
+                .then((result) => {
+                    if (!cancelled && result) {
+                        autoDefinitionRef.current = { request, definition: result };
+                        setDefinition(result);
+                    }
+                })
+                .catch(() => {}); // The local lookup service is optional.
+        }, 600);
+
+        return () => {
+            cancelled = true;
+            clearTimeout(timeout);
+        };
+    }, [open, word, text, definition, onRequestDefinition]);
+
+    // A custom Anki field keeps the sentence translation separate from the word definition.
+    const translationMapped = Boolean(settings.customAnkiFields[sentenceTranslationField]?.trim());
+    const translation = customFieldValues[sentenceTranslationField] ?? '';
+    const autoTranslationRef = useRef<{ sentence: string; value: string }>(undefined);
+    useEffect(() => {
+        const last = autoTranslationRef.current;
+        if (
+            !open ||
+            !onRequestDefinition ||
+            !translationMapped ||
+            !text.trim() ||
+            (last?.sentence === text && translation === last.value) ||
+            (translation !== '' && translation !== last?.value)
+        ) {
+            return;
+        }
+        let cancelled = false;
+        const timeout = setTimeout(() => {
+            onRequestDefinition('', text)
+                .then((result) => {
+                    if (!cancelled && result) {
+                        autoTranslationRef.current = { sentence: text, value: result };
+                        setCustomFieldValues((current) => ({ ...current, [sentenceTranslationField]: result }));
+                    }
+                })
+                .catch(() => {});
+        }, 600);
+        return () => {
+            cancelled = true;
+            clearTimeout(timeout);
+        };
+    }, [open, text, translation, translationMapped, onRequestDefinition]);
 
     useEffect(() => {
         anki.version()
@@ -887,6 +962,24 @@ const AnkiDialog = ({
                 </Toolbar>
                 <DialogContent ref={dialogRefCallback}>
                     <form className={classes.root}>
+                        {onRequestDefinition && translationMapped && (
+                            <TextField
+                                variant="filled"
+                                fullWidth
+                                multiline
+                                label={t('ankiDialog.sentenceTranslation')}
+                                value={translation}
+                                onChange={(e) =>
+                                    setCustomFieldValues((current) => ({
+                                        ...current,
+                                        [sentenceTranslationField]: e.target.value,
+                                    }))
+                                }
+                            />
+                        )}
+                        {onRequestDefinition && !translationMapped && translation && (
+                            <Alert severity="warning">{t('ankiDialog.sentenceTranslationUnmapped')}</Alert>
+                        )}
                         {ankiFieldModels.map((model) => {
                             const key = model.custom ? `custom_${model.key}` : `standard_${model.key}`;
 
@@ -982,13 +1075,15 @@ const AnkiDialog = ({
                                             selectedSubtitles={selectedSubtitles.filter((s) => s.track === 2)}
                                         />
                                     )}
-                                    {model.custom && model.field.display && (
-                                        <CustomField
-                                            name={model.key}
-                                            text={customFieldValues[model.key] || ''}
-                                            onTextChange={handleCustomFieldChange}
-                                        />
-                                    )}
+                                    {model.custom &&
+                                        model.field.display &&
+                                        !(onRequestDefinition && model.key === sentenceTranslationField) && (
+                                            <CustomField
+                                                name={model.key}
+                                                text={customFieldValues[model.key] || ''}
+                                                onTextChange={handleCustomFieldChange}
+                                            />
+                                        )}
                                 </React.Fragment>
                             );
                         })}
